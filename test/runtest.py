@@ -15,10 +15,10 @@ Device.pin_factory = LGPIOFactory()
 #   BOARD 18 -> BCM 18 (PWMB)
 #   BOARD 12 -> BCM 23 (BIN1)
 #   BOARD 16 -> BCM 24 (BIN2)
-pwm_a = PWMOutputDevice(13)  # PWMA
-pwm_b = PWMOutputDevice(18)  # PWMB
-motor_a = Motor(forward=5, backward=6)   # AIN1, AIN2
-motor_b = Motor(forward=23, backward=24)  # BIN1, BIN2
+pwm_a = PWMOutputDevice(18)  # PWMA
+pwm_b = PWMOutputDevice(13)  # PWMB
+motor_a = Motor(forward=23, backward=24)   # AIN1, AIN2
+motor_b = Motor(forward=5, backward=6)  # BIN1, BIN2
 stby = OutputDevice(17)                  # MOTOR_STBY (追加)
 
 speed = 0.8  # 0.0〜1.0（80%相当）
