@@ -1,830 +1,476 @@
 """
-# MicropyGPS - a GPS NMEA sentence parser for Micropython/Python 3.X
-# Copyright (c) 2017 Michael Calvin McCoy (calvin.mccoy@protonmail.com)
-# The MIT License (MIT) - see LICENSE file
+test_GPSrun_new.py
+===================
+GPS誘導走行テストコード（新版）
+
+元の test_GPSrun.py (RPi.GPIO直叩き版) の構成・挙動をそのまま踏襲しつつ、
+NEW2026 リポジトリの test/ 以下 (GPS.py, HC-SR04.py, runtest.py) と
+矛盾しないよう、以下の点を書き換えています。
+
+【リポジトリとの整合性を取るために変更した点】
+  1. モーター制御: RPi.GPIO の直接叩きから、runtest.py と同じ
+     gpiozero (Motor / PWMOutputDevice / OutputDevice) + LGPIOFactory に統一。
+     PWMA/AIN1/AIN2/PWMB/BIN1/BIN2 のBCM番号も runtest.py の
+     「BOARD→BCM変換」に合わせて 13/5/6/18/23/24 に変更し、
+     runtest.py にある MOTOR_STBY(BCM17) の ON/OFF 制御も追加。
+     (元コードの 18/8/25/10/9/11 という番号はリポジトリのハード構成と
+      矛盾するため採用していません)
+  2. GPSスレッド: GPS.py の rungps() と同じ方式に統一。
+     - readline() が空バイト列を返すケース (sentence[0] で IndexError に
+       なる元コードの潜在バグ) を回避
+     - decode は GPS.py と同じ "ascii", errors="replace"
+     - MicropyGPS(9, "dd") はそのまま(dd modeでは latitude/longitude が
+       [10進度, 半球] のリストで返るため、元コードの gps.latitude[0] の
+       使い方自体は正しいので変更していません)
+  3. CSVヘッダー: 元コードはヘッダー17列とデータ行17列の「並び」が
+     ずれるバグ(2列目がAccXのはずがPhaseの値が入る等)があったため、
+     ヘッダーとデータの列順を一致させています。
+
+【今回追加】最終ゴール判定へのHC-SR04超音波距離センサの統合
+  GPS誘導で目標地点付近(distance<5.0)まで来た後、HC-SR04.py と同じ
+  ピン配置(TRIG=BCM8, ECHO=BCM7)・計算式でオブジェクトを探索する
+  最終フェーズ(sonar_final_phase)を追加しました。
+    1. 機体を左右に振りながら前方をスキャン
+    2. 前方にオブジェクトを検出したらその方向へ前進
+    3. HC-SR04の距離がゴール判定用の閾値を下回ったらゴール確定
+  この最終フェーズで使う閾値・スイング時間は、他の定数とは別の
+  「ゴール判定(HC-SR04)用の閾値」セクションにまとめています。
+
+BNO055 (9軸センサ) 部分はリポジトリの test/ フォルダには実装が
+含まれていない(main/main.py 側で使う想定)ため、元コードのまま
+`import BNO055` を維持しています。実行環境にこのモジュールが
+必要です。
 """
 
-# TODO:
-# Time Since First Fix
-# Distance/Time to Target
-# More Helper Functions
-# Dynamically limit sentences types to parse
-
-from math import floor, modf
-
-# Import utime or time for fix time handling
-try:
-    # Assume running on MicroPython
-    import utime
-except ImportError:
-    # Otherwise default to time module for non-embedded implementations
-    # Should still support millisecond resolution.
-    import time
-
-
-class MicropyGPS(object):
-    """GPS NMEA Sentence Parser. Creates object that stores all relevant GPS data and statistics.
-    Parses sentences one character at a time using update(). """
-
-    # Max Number of Characters a valid sentence can be (based on GGA sentence)
-    SENTENCE_LIMIT = 90
-    __HEMISPHERES = ('N', 'S', 'E', 'W')
-    __NO_FIX = 1
-    __FIX_2D = 2
-    __FIX_3D = 3
-    __DIRECTIONS = ('N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W',
-                    'WNW', 'NW', 'NNW')
-    __MONTHS = ('January', 'February', 'March', 'April', 'May',
-                'June', 'July', 'August', 'September', 'October',
-                'November', 'December')
-
-    def __init__(self, local_offset=0, location_formatting='ddm'):
-        """
-        Setup GPS Object Status Flags, Internal Data Registers, etc
-            local_offset (int): Timzone Difference to UTC
-            location_formatting (str): Style For Presenting Longitude/Latitude:
-                                       Decimal Degree Minute (ddm) - 40° 26.767′ N
-                                       Degrees Minutes Seconds (dms) - 40° 26′ 46″ N
-                                       Decimal Degrees (dd) - 40.446° N
-        """
-
-        #####################
-        # Object Status Flags
-        self.sentence_active = False
-        self.active_segment = 0
-        self.process_crc = False
-        self.gps_segments = []
-        self.crc_xor = 0
-        self.char_count = 0
-        self.fix_time = 0
-
-        #####################
-        # Sentence Statistics
-        self.crc_fails = 0
-        self.clean_sentences = 0
-        self.parsed_sentences = 0
-
-        #####################
-        # Logging Related
-        self.log_handle = None
-        self.log_en = False
-
-        #####################
-        # Data From Sentences
-        # Time
-        self.timestamp = [0, 0, 0.0]
-        self.date = [0, 0, 0]
-        self.local_offset = local_offset
-
-        # Position/Motion
-        self._latitude = [0, 0.0, 'N']
-        self._longitude = [0, 0.0, 'W']
-        self.coord_format = location_formatting
-        self.speed = [0.0, 0.0, 0.0]
-        self.course = 0.0
-        self.altitude = 0.0
-        self.geoid_height = 0.0
-
-        # GPS Info
-        self.satellites_in_view = 0
-        self.satellites_in_use = 0
-        self.satellites_used = []
-        self.last_sv_sentence = 0
-        self.total_sv_sentences = 0
-        self.satellite_data = dict()
-        self.hdop = 0.0
-        self.pdop = 0.0
-        self.vdop = 0.0
-        self.valid = False
-        self.fix_stat = 0
-        self.fix_type = 1
-
-    ########################################
-    # Coordinates Translation Functions
-    ########################################
-    @property
-    def latitude(self):
-        """Format Latitude Data Correctly"""
-        if self.coord_format == 'dd':
-            decimal_degrees = self._latitude[0] + (self._latitude[1] / 60)
-            return [decimal_degrees, self._latitude[2]]
-        elif self.coord_format == 'dms':
-            minute_parts = modf(self._latitude[1])
-            seconds = round(minute_parts[0] * 60)
-            return [self._latitude[0], int(minute_parts[1]), seconds, self._latitude[2]]
-        else:
-            return self._latitude
-
-    @property
-    def longitude(self):
-        """Format Longitude Data Correctly"""
-        if self.coord_format == 'dd':
-            decimal_degrees = self._longitude[0] + (self._longitude[1] / 60)
-            return [decimal_degrees, self._longitude[2]]
-        elif self.coord_format == 'dms':
-            minute_parts = modf(self._longitude[1])
-            seconds = round(minute_parts[0] * 60)
-            return [self._longitude[0], int(minute_parts[1]), seconds, self._longitude[2]]
-        else:
-            return self._longitude
-
-    ########################################
-    # Logging Related Functions
-    ########################################
-    def start_logging(self, target_file, mode="append"):
-        """
-        Create GPS data log object
-        """
-        # Set Write Mode Overwrite or Append
-        mode_code = 'w' if mode == 'new' else 'a'
-
-        try:
-            self.log_handle = open(target_file, mode_code)
-        except AttributeError:
-            print("Invalid FileName")
-            return False
-
-        self.log_en = True
-        return True
-
-    def stop_logging(self):
-        """
-        Closes the log file handler and disables further logging
-        """
-        try:
-            self.log_handle.close()
-        except AttributeError:
-            print("Invalid Handle")
-            return False
-
-        self.log_en = False
-        return True
-
-    def write_log(self, log_string):
-        """Attempts to write the last valid NMEA sentence character to the active file handler
-        """
-        try:
-            self.log_handle.write(log_string)
-        except TypeError:
-            return False
-        return True
-
-    ########################################
-    # Sentence Parsers
-    ########################################
-    def gprmc(self):
-        """Parse Recommended Minimum Specific GPS/Transit data (RMC)Sentence.
-        Updates UTC timestamp, latitude, longitude, Course, Speed, Date, and fix status
-        """
-
-        # UTC Timestamp
-        try:
-            utc_string = self.gps_segments[1]
-
-            if utc_string:  # Possible timestamp found
-                hours = (int(utc_string[0:2]) + self.local_offset) % 24
-                minutes = int(utc_string[2:4])
-                seconds = float(utc_string[4:])
-                self.timestamp = [hours, minutes, seconds]
-            else:  # No Time stamp yet
-                self.timestamp = [0, 0, 0.0]
-
-        except ValueError:  # Bad Timestamp value present
-            return False
-
-        # Date stamp
-        try:
-            date_string = self.gps_segments[9]
-
-            # Date string printer function assumes to be year >=2000,
-            # date_string() must be supplied with the correct century argument to display correctly
-            if date_string:  # Possible date stamp found
-                day = int(date_string[0:2])
-                month = int(date_string[2:4])
-                year = int(date_string[4:6])
-                self.date = (day, month, year)
-            else:  # No Date stamp yet
-                self.date = (0, 0, 0)
-
-        except ValueError:  # Bad Date stamp value present
-            return False
-
-        # Check Receiver Data Valid Flag
-        if self.gps_segments[2] == 'A':  # Data from Receiver is Valid/Has Fix
-
-            # Longitude / Latitude
-            try:
-                # Latitude
-                l_string = self.gps_segments[3]
-                lat_degs = int(l_string[0:2])
-                lat_mins = float(l_string[2:])
-                lat_hemi = self.gps_segments[4]
-
-                # Longitude
-                l_string = self.gps_segments[5]
-                lon_degs = int(l_string[0:3])
-                lon_mins = float(l_string[3:])
-                lon_hemi = self.gps_segments[6]
-            except ValueError:
-                return False
-
-            if lat_hemi not in self.__HEMISPHERES:
-                return False
-
-            if lon_hemi not in self.__HEMISPHERES:
-                return False
-
-            # Speed
-            try:
-                spd_knt = float(self.gps_segments[7])
-            except ValueError:
-                return False
-
-            # Course
-            try:
-                if self.gps_segments[8]:
-                    course = float(self.gps_segments[8])
-                else:
-                    course = 0.0
-            except ValueError:
-                return False
-
-            # TODO - Add Magnetic Variation
-
-            # Update Object Data
-            self._latitude = [lat_degs, lat_mins, lat_hemi]
-            self._longitude = [lon_degs, lon_mins, lon_hemi]
-            # Include mph and hm/h
-            self.speed = [spd_knt, spd_knt * 1.151, spd_knt * 1.852]
-            self.course = course
-            self.valid = True
-
-            # Update Last Fix Time
-            self.new_fix_time()
-
-        else:  # Clear Position Data if Sentence is 'Invalid'
-            self._latitude = [0, 0.0, 'N']
-            self._longitude = [0, 0.0, 'W']
-            self.speed = [0.0, 0.0, 0.0]
-            self.course = 0.0
-            self.valid = False
-
-        return True
-
-    def gpgll(self):
-        """Parse Geographic Latitude and Longitude (GLL)Sentence. Updates UTC timestamp, latitude,
-        longitude, and fix status"""
-
-        # UTC Timestamp
-        try:
-            utc_string = self.gps_segments[5]
-
-            if utc_string:  # Possible timestamp found
-                hours = (int(utc_string[0:2]) + self.local_offset) % 24
-                minutes = int(utc_string[2:4])
-                seconds = float(utc_string[4:])
-                self.timestamp = [hours, minutes, seconds]
-            else:  # No Time stamp yet
-                self.timestamp = [0, 0, 0.0]
-
-        except ValueError:  # Bad Timestamp value present
-            return False
-
-        # Check Receiver Data Valid Flag
-        if self.gps_segments[6] == 'A':  # Data from Receiver is Valid/Has Fix
-
-            # Longitude / Latitude
-            try:
-                # Latitude
-                l_string = self.gps_segments[1]
-                lat_degs = int(l_string[0:2])
-                lat_mins = float(l_string[2:])
-                lat_hemi = self.gps_segments[2]
-
-                # Longitude
-                l_string = self.gps_segments[3]
-                lon_degs = int(l_string[0:3])
-                lon_mins = float(l_string[3:])
-                lon_hemi = self.gps_segments[4]
-            except ValueError:
-                return False
-
-            if lat_hemi not in self.__HEMISPHERES:
-                return False
-
-            if lon_hemi not in self.__HEMISPHERES:
-                return False
-
-            # Update Object Data
-            self._latitude = [lat_degs, lat_mins, lat_hemi]
-            self._longitude = [lon_degs, lon_mins, lon_hemi]
-            self.valid = True
-
-            # Update Last Fix Time
-            self.new_fix_time()
-
-        else:  # Clear Position Data if Sentence is 'Invalid'
-            self._latitude = [0, 0.0, 'N']
-            self._longitude = [0, 0.0, 'W']
-            self.valid = False
-
-        return True
-
-    def gpvtg(self):
-        """Parse Track Made Good and Ground Speed (VTG) Sentence. Updates speed and course"""
-        try:
-            course = float(self.gps_segments[1]) if self.gps_segments[1] else 0.0
-            spd_knt = float(self.gps_segments[5]) if self.gps_segments[5] else 0.0
-        except ValueError:
-            return False
-
-        # Include mph and km/h
-        self.speed = (spd_knt, spd_knt * 1.151, spd_knt * 1.852)
-        self.course = course
-        return True
-
-    def gpgga(self):
-        """Parse Global Positioning System Fix Data (GGA) Sentence. Updates UTC timestamp, latitude, longitude,
-        fix status, satellites in use, Horizontal Dilution of Precision (HDOP), altitude, geoid height and fix status"""
-
-        try:
-            # UTC Timestamp
-            utc_string = self.gps_segments[1]
-
-            # Skip timestamp if receiver doesn't have on yet
-            if utc_string:
-                hours = (int(utc_string[0:2]) + self.local_offset) % 24
-                minutes = int(utc_string[2:4])
-                seconds = float(utc_string[4:])
-            else:
-                hours = 0
-                minutes = 0
-                seconds = 0.0
-
-            # Number of Satellites in Use
-            satellites_in_use = int(self.gps_segments[7])
-
-            # Get Fix Status
-            fix_stat = int(self.gps_segments[6])
-
-        except (ValueError, IndexError):
-            return False
-
-        try:
-            # Horizontal Dilution of Precision
-            hdop = float(self.gps_segments[8])
-        except (ValueError, IndexError):
-            hdop = 0.0
-
-        # Process Location and Speed Data if Fix is GOOD
-        if fix_stat:
-
-            # Longitude / Latitude
-            try:
-                # Latitude
-                l_string = self.gps_segments[2]
-                lat_degs = int(l_string[0:2])
-                lat_mins = float(l_string[2:])
-                lat_hemi = self.gps_segments[3]
-
-                # Longitude
-                l_string = self.gps_segments[4]
-                lon_degs = int(l_string[0:3])
-                lon_mins = float(l_string[3:])
-                lon_hemi = self.gps_segments[5]
-            except ValueError:
-                return False
-
-            if lat_hemi not in self.__HEMISPHERES:
-                return False
-
-            if lon_hemi not in self.__HEMISPHERES:
-                return False
-
-            # Altitude / Height Above Geoid
-            try:
-                altitude = float(self.gps_segments[9])
-                geoid_height = float(self.gps_segments[11])
-            except ValueError:
-                altitude = 0
-                geoid_height = 0
-
-            # Update Object Data
-            self._latitude = [lat_degs, lat_mins, lat_hemi]
-            self._longitude = [lon_degs, lon_mins, lon_hemi]
-            self.altitude = altitude
-            self.geoid_height = geoid_height
-
-        # Update Object Data
-        self.timestamp = [hours, minutes, seconds]
-        self.satellites_in_use = satellites_in_use
-        self.hdop = hdop
-        self.fix_stat = fix_stat
-
-        # If Fix is GOOD, update fix timestamp
-        if fix_stat:
-            self.new_fix_time()
-
-        return True
-
-    def gpgsa(self):
-        """Parse GNSS DOP and Active Satellites (GSA) sentence. Updates GPS fix type, list of satellites used in
-        fix calculation, Position Dilution of Precision (PDOP), Horizontal Dilution of Precision (HDOP), Vertical
-        Dilution of Precision, and fix status"""
-
-        # Fix Type (None,2D or 3D)
-        try:
-            fix_type = int(self.gps_segments[2])
-        except ValueError:
-            return False
-
-        # Read All (up to 12) Available PRN Satellite Numbers
-        sats_used = []
-        for sats in range(12):
-            sat_number_str = self.gps_segments[3 + sats]
-            if sat_number_str:
-                try:
-                    sat_number = int(sat_number_str)
-                    sats_used.append(sat_number)
-                except ValueError:
-                    return False
-            else:
-                break
-
-        # PDOP,HDOP,VDOP
-        try:
-            pdop = float(self.gps_segments[15])
-            hdop = float(self.gps_segments[16])
-            vdop = float(self.gps_segments[17])
-        except ValueError:
-            return False
-
-        # Update Object Data
-        self.fix_type = fix_type
-
-        # If Fix is GOOD, update fix timestamp
-        if fix_type > self.__NO_FIX:
-            self.new_fix_time()
-
-        self.satellites_used = sats_used
-        self.hdop = hdop
-        self.vdop = vdop
-        self.pdop = pdop
-
-        return True
-
-    def gpgsv(self):
-        """Parse Satellites in View (GSV) sentence. Updates number of SV Sentences,the number of the last SV sentence
-        parsed, and data on each satellite present in the sentence"""
-        try:
-            num_sv_sentences = int(self.gps_segments[1])
-            current_sv_sentence = int(self.gps_segments[2])
-            sats_in_view = int(self.gps_segments[3])
-        except ValueError:
-            return False
-
-        # Create a blank dict to store all the satellite data from this sentence in:
-        # satellite PRN is key, tuple containing telemetry is value
-        satellite_dict = dict()
-
-        # Calculate  Number of Satelites to pull data for and thus how many segment positions to read
-        if num_sv_sentences == current_sv_sentence:
-            # Last sentence may have 1-4 satellites; 5 - 20 positions
-            sat_segment_limit = (sats_in_view - ((num_sv_sentences - 1) * 4)) * 5
-        else:
-            sat_segment_limit = 20  # Non-last sentences have 4 satellites and thus read up to position 20
-
-        # Try to recover data for up to 4 satellites in sentence
-        for sats in range(4, sat_segment_limit, 4):
-
-            # If a PRN is present, grab satellite data
-            if self.gps_segments[sats]:
-                try:
-                    sat_id = int(self.gps_segments[sats])
-                except (ValueError,IndexError):
-                    return False
-
-                try:  # elevation can be null (no value) when not tracking
-                    elevation = int(self.gps_segments[sats+1])
-                except (ValueError,IndexError):
-                    elevation = None
-
-                try:  # azimuth can be null (no value) when not tracking
-                    azimuth = int(self.gps_segments[sats+2])
-                except (ValueError,IndexError):
-                    azimuth = None
-
-                try:  # SNR can be null (no value) when not tracking
-                    snr = int(self.gps_segments[sats+3])
-                except (ValueError,IndexError):
-                    snr = None
-            # If no PRN is found, then the sentence has no more satellites to read
-            else:
-                break
-
-            # Add Satellite Data to Sentence Dict
-            satellite_dict[sat_id] = (elevation, azimuth, snr)
-
-        # Update Object Data
-        self.total_sv_sentences = num_sv_sentences
-        self.last_sv_sentence = current_sv_sentence
-        self.satellites_in_view = sats_in_view
-
-        # For a new set of sentences, we either clear out the existing sat data or
-        # update it as additional SV sentences are parsed
-        if current_sv_sentence == 1:
-            self.satellite_data = satellite_dict
-        else:
-            self.satellite_data.update(satellite_dict)
-
-        return True
-
-    ##########################################
-    # Data Stream Handler Functions
-    ##########################################
-
-    def new_sentence(self):
-        """Adjust Object Flags in Preparation for a New Sentence"""
-        self.gps_segments = ['']
-        self.active_segment = 0
-        self.crc_xor = 0
-        self.sentence_active = True
-        self.process_crc = True
-        self.char_count = 0
-
-    def update(self, new_char):
-        """Process a new input char and updates GPS object if necessary based on special characters ('$', ',', '*')
-        Function builds a list of received string that are validate by CRC prior to parsing by the  appropriate
-        sentence function. Returns sentence type on successful parse, None otherwise"""
-
-        valid_sentence = False
-
-        # Validate new_char is a printable char
-        ascii_char = ord(new_char)
-
-        if 10 <= ascii_char <= 126:
-            self.char_count += 1
-
-            # Write Character to log file if enabled
-            if self.log_en:
-                self.write_log(new_char)
-
-            # Check if a new string is starting ($)
-            if new_char == '$':
-                self.new_sentence()
+import csv
+import datetime
+import math
+import threading
+import time
+from pathlib import Path
+
+import serial
+
+import BNO055
+from micropyGPS import MicropyGPS
+
+from gpiozero import (
+    Motor,
+    PWMOutputDevice,
+    OutputDevice,
+    DigitalOutputDevice,
+    DigitalInputDevice,
+    Device,
+)
+from gpiozero.pins.lgpio import LGPIOFactory
+
+Device.pin_factory = LGPIOFactory()
+
+# ===========================================================================
+# 定数　上書きしない
+# ===========================================================================
+MAG_CONST = 8.9  # 地磁気補正用の偏角
+CALIBRATION_MILLITIME = 20 * 1000
+TARGET_LAT = 38.26052
+TARGET_LNG = 140.8544151
+DATA_SAMPLING_RATE = 0.00001
+EARTH_RADIUS = 6378136.59
+
+# --- GPSモジュール設定 (GPS.py と同じ) ---
+GPS_PORT = "/dev/serial0"
+GPS_BAUDRATE = 9600
+GPS_LOCAL_OFFSET = 9  # JST(+9h)
+
+# --- モーターピン(BCM) : runtest.py と同じ配線 ---
+PWMA = 13   # 右タイヤ用PWM
+AIN1 = 5
+AIN2 = 6
+PWMB = 18   # 左タイヤ用PWM
+BIN1 = 23
+BIN2 = 24
+STBY = 11
+
+SPEED_MAX = 1.0  # gpiozeroは0.0〜1.0でデューティ比を指定する
+
+# ===========================================================================
+# ゴール判定(HC-SR04)用の閾値　※他の定数とは分けて管理する
+# ===========================================================================
+SONAR_TRIG_PIN = 8   # HC-SR04.py と同じ TRIG(BCM8)
+SONAR_ECHO_PIN = 7   # HC-SR04.py と同じ ECHO(BCM7)
+
+GOAL_SONAR_THRESHOLD_CM = 15.0   # この距離未満になったらゴール確定
+OBJECT_DETECT_RANGE_CM = 150.0   # この距離未満なら「前方にオブジェクトあり」と判定
+
+SWING_STEP_SEC = 0.4     # 左右に振る際、片側あたりの動作時間[s]
+SONAR_POLL_INTERVAL_SEC = 0.05  # HC-SR04を読む間隔[s]
+
+# ===========================================================================
+# 変数
+# ===========================================================================
+start = 0.0
+end = 0.0
+acc = [0.0, 0.0, 0.0]
+gyro = [0.0, 0.0, 0.0]
+mag = [0.0, 0.0, 0.0]
+lat = 0.0  # GPSセンサーから取得
+lng = 0.0
+distance = 0.0
+angle = 0.0
+azimuth = 0.0
+direction = 0.0
+phase = 0
+gps_detect = 0
+
+bmx = BNO055.BNO055()
+nowTime = datetime.datetime.now()
+fileName = Path("log") / ("testlog_" + nowTime.strftime("%Y-%m%d-%H%M%S") + ".csv")
+
+# ===========================================================================
+# モーター (gpiozero, runtest.py と同じ構成)
+# ===========================================================================
+pwm_a = PWMOutputDevice(PWMA)
+pwm_b = PWMOutputDevice(PWMB)
+motor_a = Motor(forward=AIN1, backward=AIN2)
+motor_b = Motor(forward=BIN1, backward=BIN2)
+stby = OutputDevice(STBY)
+
+
+def motors_stop():
+    pwm_a.value = 0
+    pwm_b.value = 0
+    motor_a.stop()
+    motor_b.stop()
+    stby.off()
+
+
+def motors_drive(pwm_a_ratio, pwm_b_ratio):
+    """左右のタイヤを両方前進方向で駆動する(比率違いで旋回/超信地旋回を表現)"""
+    stby.on()
+    motor_a.forward()
+    motor_b.forward()
+    pwm_a.value = pwm_a_ratio
+    pwm_b.value = pwm_b_ratio
+
+
+def motor_left_only():
+    """右モーターのみ停止・左モーターのみ前進(超信地に近い左旋回)"""
+    stby.on()
+    motor_a.stop()
+    motor_b.forward()
+    pwm_a.value = 0
+    pwm_b.value = SPEED_MAX
+
+
+def motor_right_only():
+    """左モーターのみ停止・右モーターのみ前進(超信地に近い右旋回)"""
+    stby.on()
+    motor_a.forward()
+    motor_b.stop()
+    pwm_a.value = SPEED_MAX
+    pwm_b.value = 0
+
+
+# ===========================================================================
+# HC-SR04 (超音波距離センサ) : test/HC-SR04.py の実装をそのまま踏襲
+# ===========================================================================
+class HCSR04:
+    """HC-SR04.py と同じ計算式・ピン配置の超音波距離センサ制御クラス"""
+
+    SOUND_SPEED = 343.0    # [m/s] 20℃ 空気中の音速
+    TRIGGER_PULSE = 10e-6  # [s]   TRIGパルス幅
+    SETTLE_TIME = 0.01     # [s]   TRIG送出前の安定待機
+    ECHO_TIMEOUT = 0.03    # [s]   ECHO待機タイムアウト
+
+    def __init__(self, pin_trig=SONAR_TRIG_PIN, pin_echo=SONAR_ECHO_PIN):
+        self._trig = DigitalOutputDevice(pin_trig, initial_value=False)
+        self._echo = DigitalInputDevice(pin_echo)
+
+    def get_distance_m(self):
+        self._trig.off()
+        time.sleep(self.SETTLE_TIME)
+
+        self._trig.on()
+        time.sleep(self.TRIGGER_PULSE)
+        self._trig.off()
+
+        timeout_start = time.time()
+        while not self._echo.value:
+            if time.time() - timeout_start > self.ECHO_TIMEOUT:
                 return None
+        pulse_start = time.time()
 
-            elif self.sentence_active:
+        while self._echo.value:
+            if time.time() - pulse_start > self.ECHO_TIMEOUT:
+                return None
+        pulse_end = time.time()
 
-                # Check if sentence is ending (*)
-                if new_char == '*':
-                    self.process_crc = False
-                    self.active_segment += 1
-                    self.gps_segments.append('')
-                    return None
+        duration = pulse_end - pulse_start
+        return duration * self.SOUND_SPEED / 2.0
 
-                # Check if a section is ended (,), Create a new substring to feed
-                # characters to
-                elif new_char == ',':
-                    self.active_segment += 1
-                    self.gps_segments.append('')
+    def close(self):
+        self._trig.off()
+        self._trig.close()
+        self._echo.close()
 
-                # Store All Other printable character and check CRC when ready
-                else:
-                    self.gps_segments[self.active_segment] += new_char
 
-                    # When CRC input is disabled, sentence is nearly complete
-                    if not self.process_crc:
+def sonar_final_phase():
+    """
+    GPS誘導でゴールエリア(distance<5.0)に入った後の最終ゴール判定。
 
-                        if len(self.gps_segments[self.active_segment]) == 2:
-                            try:
-                                final_crc = int(self.gps_segments[self.active_segment], 16)
-                                if self.crc_xor == final_crc:
-                                    valid_sentence = True
-                                else:
-                                    self.crc_fails += 1
-                            except ValueError:
-                                pass  # CRC Value was deformed and could not have been correct
+    機体を左右に振ってHC-SR04で前方をスキャンし、
+    オブジェクトを検出したらその方向へ前進、
+    距離が GOAL_SONAR_THRESHOLD_CM を下回ったらゴールとする。
+    """
+    global direction
 
-                # Update CRC
-                if self.process_crc:
-                    self.crc_xor ^= ascii_char
+    sensor = HCSR04()
+    try:
+        print("phase5 : HC-SR04 final approach")
+        while True:
+            dist_m = sensor.get_distance_m()
+            dist_cm = dist_m * 100.0 if dist_m is not None else None
 
-                # If a Valid Sentence Was received and it's a supported sentence, then parse it!!
-                if valid_sentence:
-                    self.clean_sentences += 1  # Increment clean sentences received
-                    self.sentence_active = False  # Clear Active Processing Flag
+            # 閾値未満になったらゴール確定
+            if dist_cm is not None and dist_cm < GOAL_SONAR_THRESHOLD_CM:
+                direction = 360.0
+                motors_stop()
+                print(f"goal! (HC-SR04 dist={dist_cm:.1f}cm)")
+                return
 
-                    if self.gps_segments[0] in self.supported_sentences:
+            # 前方にオブジェクトを検出済みならそのまま前進を続ける
+            if dist_cm is not None and dist_cm < OBJECT_DETECT_RANGE_CM:
+                direction = -360.0  # 前進
+                time.sleep(SONAR_POLL_INTERVAL_SEC)
+                continue
 
-                        # parse the Sentence Based on the message type, return True if parse is clean
-                        if self.supported_sentences[self.gps_segments[0]](self):
+            # 見つからない場合は左右に振ってスキャンする
+            direction = 500.0  # 左に振る
+            time.sleep(SWING_STEP_SEC)
+            direction = 360.0
+            dist_m = sensor.get_distance_m()
+            dist_cm = dist_m * 100.0 if dist_m is not None else None
+            if dist_cm is not None and dist_cm < OBJECT_DETECT_RANGE_CM:
+                continue  # 次のループ先頭でオブジェクト方向に前進する
 
-                            # Let host know that the GPS object was updated by returning parsed sentence type
-                            self.parsed_sentences += 1
-                            return self.gps_segments[0]
+            direction = 600.0  # 右に振る
+            time.sleep(SWING_STEP_SEC)
+            direction = 360.0
+            time.sleep(SONAR_POLL_INTERVAL_SEC)
+    finally:
+        sensor.close()
 
-                # Check that the sentence buffer isn't filling up with Garage waiting for the sentence to complete
-                if self.char_count > self.SENTENCE_LIMIT:
-                    self.sentence_active = False
 
-        # Tell Host no new sentence was parsed
-        return None
+# ===========================================================================
+# メイン
+# ===========================================================================
+def main():
+    global direction
 
-    def new_fix_time(self):
-        """Updates a high resolution counter with current time when fix is updated. Currently only triggered from
-        GGA, GSA and RMC sentences"""
+    Setup()
+
+    while True:
         try:
-            self.fix_time = utime.ticks_ms()
-        except NameError:
-            self.fix_time = time.time()
+            print("phase3 : GPS start")
+            if distance < 5.0:
+                # GPS誘導ではここでゴール確定としていたが、
+                # 最終的なゴール判定はHC-SR04による判定に置き換える
+                sonar_final_phase()
+                break
+        except KeyboardInterrupt:
+            direction = 360.0
+            motors_stop()
+            break
 
-    #########################################
-    # User Helper Functions
-    # These functions make working with the GPS object data easier
-    #########################################
 
-    def satellite_data_updated(self):
-        """
-        Checks if the all the GSV sentences in a group have been read, making satellite data complete
-        :return: boolean
-        """
-        if self.total_sv_sentences > 0 and self.total_sv_sentences == self.last_sv_sentence:
-            return True
+def currentMilliTime():
+    return round(time.time() * 1000)
+
+
+def Setup():
+    bmx.setUp()
+    fileName.parent.mkdir(parents=True, exist_ok=True)
+    with open(fileName, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "Time",
+                "Phase",
+                "AccX",
+                "AccY",
+                "AccZ",
+                "GyroX",
+                "GyroY",
+                "GyroZ",
+                "MagX",
+                "MagY",
+                "MagZ",
+                "LAT",
+                "LNG",
+                "Distance",
+                "Azimuth",
+                "Angle",
+                "Direction",
+            ]
+        )
+
+    getThread = threading.Thread(target=moveMotor_thread, args=())
+    getThread.daemon = True
+    getThread.start()
+
+    dataThread = threading.Thread(target=setData_thread, args=())
+    dataThread.daemon = True
+    dataThread.start()
+
+    gpsThread = threading.Thread(target=GPS_thread, args=())
+    gpsThread.daemon = True
+    gpsThread.start()
+
+    print("Setup OK")
+
+
+def getBmxData():  # BMXデータ取得
+    global acc, gyro, mag
+    acc = bmx.getAcc()
+    gyro = bmx.getGyro()
+    mag = bmx.getMag()
+
+
+def calcdistance():  # 目標地点までの距離計算
+    global distance
+    dx = (math.pi / 180) * EARTH_RADIUS * (TARGET_LNG - lng)
+    dy = (math.pi / 180) * EARTH_RADIUS * (TARGET_LAT - lat)
+    distance = math.sqrt(dx * dx + dy * dy)
+
+
+def calcAngle():  # 目標地点への角度計算 : north=0 east=90 west=-90
+    global angle
+    dx = (math.pi / 180) * EARTH_RADIUS * (TARGET_LNG - lng)
+    dy = (math.pi / 180) * EARTH_RADIUS * (TARGET_LAT - lat)
+    angle = 90 - math.degrees(math.atan2(dy, dx))
+    angle %= 360.0
+
+
+def calcAzimuth():  # 機体の方位角計算
+    global azimuth
+    azimuth = 90 - math.degrees(math.atan2(mag[1], mag[0]))
+    azimuth *= -1
+    azimuth %= 360.0
+
+
+def set_direction():  # -180<direction<180 : direction>0で右旋回
+    global direction
+    direction = azimuth - angle
+    direction %= 360.0
+    if direction > 180:
+        direction -= 360
+    if abs(direction) < 5.0:
+        direction = -360
+
+
+def GPS_thread():  # GPSモジュールを読み、緯度経度を更新する (GPS.pyと同方式)
+    global lat, lng, gps_detect
+
+    try:
+        s = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=5)
+    except serial.SerialException as e:
+        print(f"[ERROR] シリアルポートを開けません: {e}")
+        return
+
+    s.readline()  # 最初の1行は中途半端なデータのことがあるので捨てる
+    gps = MicropyGPS(GPS_LOCAL_OFFSET, "dd")
+
+    while True:
+        raw = s.readline()
+        if not raw:
+            continue
+
+        if s.in_waiting > 64:  # バッファ削除
+            s.reset_input_buffer()
+
+        sentence = raw.decode("ascii", errors="replace")
+        if not sentence.startswith("$"):
+            continue
+
+        for ch in sentence:  # 1文字ずつmicropyGPSに渡す
+            gps.update(ch)
+
+        lat = gps.latitude[0]
+        lng = gps.longitude[0]
+
+        if lat != 0.0:
+            gps_detect = 1
         else:
-            return False
+            gps_detect = 0
+            print("None GNSS value")
 
-    def unset_satellite_data_updated(self):
-        """
-        Mark GSV sentences as read indicating the data has been used and future updates are fresh
-        """
-        self.last_sv_sentence = 0
 
-    def satellites_visible(self):
-        """
-        Returns a list of of the satellite PRNs currently visible to the receiver
-        :return: list
-        """
-        return list(self.satellite_data.keys())
+def setData_thread():
+    global end
+    while True:
+        getBmxData()
+        calcAngle()
+        calcAzimuth()
+        set_direction()
+        calcdistance()
+        end = time.time()
 
-    def time_since_fix(self):
-        """Returns number of millisecond since the last sentence with a valid fix was parsed. Returns 0 if
-        no fix has been found"""
+        print(f"lat:{lat}")
+        print(f"lng:{lng}")
+        print(f"azimuth:{azimuth}")
+        print(f"angle:{angle}")
 
-        # Test if a Fix has been found
-        if self.fix_time == 0:
-            return -1
+        with open(fileName, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    round(end - start, 3),
+                    round(phase, 1),
+                    acc[0],
+                    acc[1],
+                    acc[2],
+                    gyro[0],
+                    gyro[1],
+                    gyro[2],
+                    mag[0],
+                    mag[1],
+                    mag[2],
+                    lat,
+                    lng,
+                    distance,
+                    azimuth,
+                    angle,
+                    direction,
+                ]
+            )
+        time.sleep(DATA_SAMPLING_RATE)
 
-        # Try calculating fix time using utime; if not running MicroPython
-        # time.time() returns a floating point value in secs
-        try:
-            current = utime.ticks_diff(utime.ticks_ms(), self.fix_time)
-        except NameError:
-            current = (time.time() - self.fix_time) * 1000  # ms
 
-        return current
+def moveMotor_thread():
+    while True:
+        if direction == 360.0:  # 停止
+            motors_stop()
+        elif direction == 500.0:  # 左折(超信地に近い)
+            motor_left_only()
+        elif direction == 600.0:  # 右折(超信地に近い)
+            motor_right_only()
+        elif direction == -360.0:  # 前進
+            motors_drive(SPEED_MAX, SPEED_MAX)
+        elif direction == -400.0:  # 左に回頭
+            motors_drive(0.6, SPEED_MAX)
+        elif 0.0 < direction <= 180.0:  # 左に緩旋回
+            motors_drive(0.2, SPEED_MAX)
+        elif -180.0 <= direction < 0.0:  # 右に緩旋回
+            motors_drive(SPEED_MAX, 0.2)
 
-    def compass_direction(self):
-        """
-        Determine a cardinal or inter-cardinal direction based on current course.
-        :return: string
-        """
-        # Calculate the offset for a rotated compass
-        if self.course >= 348.75:
-            offset_course = 360 - self.course
-        else:
-            offset_course = self.course + 11.25
-
-        # Each compass point is separated by 22.5 degrees, divide to find lookup value
-        dir_index = floor(offset_course / 22.5)
-
-        final_dir = self.__DIRECTIONS[dir_index]
-
-        return final_dir
-
-    def latitude_string(self):
-        """
-        Create a readable string of the current latitude data
-        :return: string
-        """
-        if self.coord_format == 'dd':
-            formatted_latitude = self.latitude
-            lat_string = str(formatted_latitude[0]) + '° ' + str(self._latitude[2])
-        elif self.coord_format == 'dms':
-            formatted_latitude = self.latitude
-            lat_string = str(formatted_latitude[0]) + '° ' + str(formatted_latitude[1]) + "' " + str(formatted_latitude[2]) + '" ' + str(formatted_latitude[3])
-        else:
-            lat_string = str(self._latitude[0]) + '° ' + str(self._latitude[1]) + "' " + str(self._latitude[2])
-        return lat_string
-
-    def longitude_string(self):
-        """
-        Create a readable string of the current longitude data
-        :return: string
-        """
-        if self.coord_format == 'dd':
-            formatted_longitude = self.longitude
-            lon_string = str(formatted_longitude[0]) + '° ' + str(self._longitude[2])
-        elif self.coord_format == 'dms':
-            formatted_longitude = self.longitude
-            lon_string = str(formatted_longitude[0]) + '° ' + str(formatted_longitude[1]) + "' " + str(formatted_longitude[2]) + '" ' + str(formatted_longitude[3])
-        else:
-            lon_string = str(self._longitude[0]) + '° ' + str(self._longitude[1]) + "' " + str(self._longitude[2])
-        return lon_string
-
-    def speed_string(self, unit='kph'):
-        """
-        Creates a readable string of the current speed data in one of three units
-        :param unit: string of 'kph','mph, or 'knot'
-        :return:
-        """
-        if unit == 'mph':
-            speed_string = str(self.speed[1]) + ' mph'
-
-        elif unit == 'knot':
-            if self.speed[0] == 1:
-                unit_str = ' knot'
-            else:
-                unit_str = ' knots'
-            speed_string = str(self.speed[0]) + unit_str
-
-        else:
-            speed_string = str(self.speed[2]) + ' km/h'
-
-        return speed_string
-
-    def date_string(self, formatting='s_mdy', century='20'):
-        """
-        Creates a readable string of the current date.
-        Can select between long format: Januray 1st, 2014
-        or two short formats:
-        11/01/2014 (MM/DD/YYYY)
-        01/11/2014 (DD/MM/YYYY)
-        :param formatting: string 's_mdy', 's_dmy', or 'long'
-        :param century: int delineating the century the GPS data is from (19 for 19XX, 20 for 20XX)
-        :return: date_string  string with long or short format date
-        """
-
-        # Long Format Januray 1st, 2014
-        if formatting == 'long':
-            # Retrieve Month string from private set
-            month = self.__MONTHS[self.date[1] - 1]
-
-            # Determine Date Suffix
-            if self.date[0] in (1, 21, 31):
-                suffix = 'st'
-            elif self.date[0] in (2, 22):
-                suffix = 'nd'
-            elif self.date[0] == (3, 23):
-                suffix = 'rd'
-            else:
-                suffix = 'th'
-
-            day = str(self.date[0]) + suffix  # Create Day String
-
-            year = century + str(self.date[2])  # Create Year String
-
-            date_string = month + ' ' + day + ', ' + year  # Put it all together
-
-        else:
-            # Add leading zeros to day string if necessary
-            if self.date[0] < 10:
-                day = '0' + str(self.date[0])
-            else:
-                day = str(self.date[0])
-
-            # Add leading zeros to month string if necessary
-            if self.date[1] < 10:
-                month = '0' + str(self.date[1])
-            else:
-                month = str(self.date[1])
-
-            # Add leading zeros to year string if necessary
-            if self.date[2] < 10:
-                year = '0' + str(self.date[2])
-            else:
-                year = str(self.date[2])
-
-            # Build final string based on desired formatting
-            if formatting == 's_dmy':
-                date_string = day + '/' + month + '/' + year
-
-            else:  # Default date format
-                date_string = month + '/' + day + '/' + year
-
-        return date_string
-
-    # All the currently supported NMEA sentences
-    supported_sentences = {'GPRMC': gprmc, 'GLRMC': gprmc,
-                           'GPGGA': gpgga, 'GLGGA': gpgga,
-                           'GPVTG': gpvtg, 'GLVTG': gpvtg,
-                           'GPGSA': gpgsa, 'GLGSA': gpgsa,
-                           'GPGSV': gpgsv, 'GLGSV': gpgsv,
-                           'GPGLL': gpgll, 'GLGLL': gpgll,
-                           'GNGGA': gpgga, 'GNRMC': gprmc,
-                           'GNVTG': gpvtg, 'GNGLL': gpgll,
-                           'GNGSA': gpgsa,
-                          }
 
 if __name__ == "__main__":
-    pass
+    try:
+        start = time.time()
+        main()
+    finally:
+        motors_stop()
+        pwm_a.close()
+        pwm_b.close()
+        motor_a.close()
+        motor_b.close()
+        stby.close()
